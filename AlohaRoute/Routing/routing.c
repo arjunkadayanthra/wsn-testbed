@@ -6,11 +6,18 @@
 #include <stdlib.h>    // rand, malloc, free, exit
 #include <string.h>    // memcpy, strerror
 #include <time.h>
+#include <unistd.h> //sleep
+
 #include "routing.h"
 #include "../ALOHA/ALOHA.h"
 #include "../GPIO/GPIO.h"
 #include "../common.h"
 #include "../util.h"
+
+#define RoutingQueueSize 64
+#define MAX_ACTIVE_NODES 32
+#define NODE_TIMEOUT 30
+
 typedef struct RoutingMessage
 {
     uint8_t src;
@@ -22,7 +29,6 @@ typedef struct RoutingMessage
     uint16_t len;
     uint8_t ctrl;
 } RoutingMessage;
-#define RoutingQueueSize 64
 
 typedef struct RoutingQueue
 {
@@ -31,14 +37,35 @@ typedef struct RoutingQueue
     sem_t mutex, full, free;
 } RoutingQueue;
 
+typedef struct NodeInfo
+{
+    uint8_t addr;
+    int RSSI;
+    unsigned short hopsToSink;
+    time_t lastSeen;
+    bool isChild;
+    bool isActive;
+} NodeInfo;
+
+typedef struct ActiveNodes
+{
+    NodeInfo nodes[MAX_ACTIVE_NODES];
+    sem_t mutex;
+    unsigned short numActive;
+    time_t lastCleanupTime;
+} ActiveNodes;
+
 static RoutingQueue sendQ, recvQ;
 static pthread_t recvT;
 static pthread_t sendT;
 static MAC mac;
 static uint8_t debugFlag;
-static const unsigned short maxTrials = 4;
+static const unsigned short maxBeacons = 5;
 static const unsigned short headerSize = 7; // [ctrl | dest | src | numHops(2) | len(2) | [data(len)] ]
-static uint8_t nextHopAddr;
+static uint8_t parentAddr;
+static int parentRSSI;
+static ActiveNodes network;
+static uint8_t loopySource;
 
 static void sendQ_init();
 static void recvQ_init();
@@ -55,17 +82,31 @@ static uint8_t getRandomLowerAddr(uint8_t self);
 static uint8_t getNextLowerAddress(uint8_t self);
 static void setDebug(uint8_t d);
 static void recvMsgQ_timed_dequeue(RoutingMessage *msg, struct timespec *ts);
+static void *sendBeacon(void *args);
+static void *receiveBeacon(void *args);
+static void selectParent();
+static int detectLoop(RoutingMessage msg);
+static void updateActiveNodes(uint8_t addr, int rssi, bool child);
+static void changeParent();
+static void initActiveNodes();
+static void cleanupInactiveNodes();
 
 // Initialize the routing layer
 int routingInit(uint8_t self, uint8_t debug, unsigned int timeout)
 {
     setDebug(debug);
-    // srand(self * time(NULL));
+    srand(self * time(NULL));
     MAC_init(&mac, self);
     mac.debug = 0;
     mac.recvTimeout = timeout;
     sendQ_init();
     recvQ_init();
+    initActiveNodes();
+    if (self != ADDR_SINK)
+    {
+        selectParent();
+    }
+
     if (pthread_create(&recvT, NULL, recvPackets_func, &mac) != 0)
     {
         printf("Failed to create Routing receive thread");
@@ -90,7 +131,8 @@ int routingSend(uint8_t dest, uint8_t *data, unsigned int len)
     msg.dest = dest;
     msg.src = mac.addr;
     msg.len = len;
-    msg.next = getNextHopAddr(mac.addr);
+    // msg.next = getNextHopAddr(mac.addr);
+    msg.next = parentAddr;
     msg.numHops = 0;
     msg.data = (uint8_t *)malloc(len);
     if (msg.data != NULL)
@@ -107,12 +149,20 @@ int routingSend(uint8_t dest, uint8_t *data, unsigned int len)
     memcpy(msg.data, data, len);
     sendQ_enqueue(msg);
 
+    // time_t currentTime = time(NULL);
+    // if (currentTime - network.lastCleanupTime > NODE_TIMEOUT)
+    // {
+    //     cleanupInactiveNodes();
+    // }
     return 1;
 }
 
 // Receive a message via the routing layer
 int routingReceive(RouteHeader *header, uint8_t *data)
 {
+    uint8_t beacon = CTRL_BCN;
+    MAC_Isend(&mac, ADDR_BROADCAST, &beacon, 1);
+
     RoutingMessage msg = recvMsgQ_dequeue();
     header->dst = msg.dest;
     header->RSSI = mac.RSSI;
@@ -135,6 +185,9 @@ int routingReceive(RouteHeader *header, uint8_t *data)
 // Receive a message via the routing layer
 int routingTimedReceive(RouteHeader *header, uint8_t *data, unsigned int timeout)
 {
+    uint8_t beacon = CTRL_BCN;
+    MAC_Isend(&mac, ADDR_BROADCAST, &beacon, 1);
+
     RoutingMessage msg;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -242,8 +295,8 @@ static void *recvPackets_func(void *args)
             free(pkt);
             continue;
         }
-        // int pktSize = MAC_recv(macTemp, pkt);
-        int pktSize = MAC_timedrecv(macTemp, pkt, 3);
+        int pktSize = MAC_recv(macTemp, pkt);
+        // int pktSize = MAC_timedrecv(macTemp, pkt, 3);
         if (pktSize == 0)
         {
             free(pkt);
@@ -253,6 +306,8 @@ static void *recvPackets_func(void *args)
         if (ctrl == CTRL_PKT)
         {
             RoutingMessage msg = buildRoutingMessage(pkt);
+
+            updateActiveNodes(mac.recvH.src_addr, mac.RSSI, true);
             if (msg.dest == ADDR_BROADCAST || msg.dest == macTemp->addr)
             {
                 // Keep
@@ -261,11 +316,18 @@ static void *recvPackets_func(void *args)
             else
             {
                 // Forward
-                msg.next = getNextHopAddr(macTemp->addr);
-                printf("%s - FWD: %02X (%02d) -> %02X msg: %s\n", timestamp(), msg.src, msg.numHops, msg.next, msg.data);
+                if (msg.src == mac.addr && msg.src != loopySource)
+                {
+                    printf("%s - Loop detected %02d (%02d) msg: %s\n", timestamp(), msg.src, msg.numHops, msg.data);
+                    changeParent();
+                    loopySource = msg.src;
+                }
+                // msg.next = getNextHopAddr(macTemp->addr);
+                msg.next = parentAddr;
+                printf("%s - FWD: %02d (%02d) -> %02d msg: %s\n", timestamp(), msg.src, msg.numHops, msg.next, msg.data);
                 if (!MAC_send(macTemp, msg.next, pkt, pktSize))
                 {
-                    printf("%s - ## Error FWD: %02X (%02d) -> %02X msg: %s\n", timestamp(), msg.src, msg.numHops, msg.next, msg.data);
+                    printf("%s - ## Error FWD: %02d (%02d) -> %02d msg: %s\n", timestamp(), msg.src, msg.numHops, msg.next, msg.data);
                 }
                 if (msg.data != NULL)
                 {
@@ -273,11 +335,15 @@ static void *recvPackets_func(void *args)
                 }
             }
         }
+        else if (ctrl == CTRL_BCN)
+        {
+            updateActiveNodes(mac.recvH.src_addr, mac.RSSI, false);
+        }
         else
         {
             if (debugFlag)
             {
-                printf("%s - ## Routing : Unknown control flag %02X \n", timestamp(), ctrl);
+                printf("%s - ## Routing : Unknown control flag %02d \n", timestamp(), ctrl);
             }
         }
         free(pkt);
@@ -333,11 +399,19 @@ static void *sendPackets_func(void *args)
             free(pkt);
             continue;
         }
-        if (!MAC_send(macTemp, msg.next, pkt, pktSize))
+        // if (!network.nodes[msg.next].isActive)
+        // {
+        //     if (!network.nodes[parentAddr].isActive)
+        //     {
+        //         changeParent();
+        //     }
+        //     msg.next = parentAddr;
+        // }
+        if (!MAC_send(macTemp, parentAddr, pkt, pktSize))
         {
-
             printf("%s - ## Error: MAC_send failed %s:%s\n", timestamp(), __FILE__, __LINE__);
         }
+        free(pkt);
     }
 }
 
@@ -374,12 +448,12 @@ static int buildRoutingPacket(RoutingMessage msg, uint8_t **routePkt)
 
 static uint8_t getNextHopAddr(uint8_t self)
 {
-    if (!nextHopAddr)
+    if (!parentAddr)
     {
-        nextHopAddr = getNextLowerAddress(self);
-        printf("%s - Next Hop: %02X\n", timestamp(), nextHopAddr);
+        parentAddr = getNextLowerAddress(self);
+        printf("%s - Next Hop: %02d\n", timestamp(), parentAddr);
     }
-    return nextHopAddr;
+    return parentAddr;
 }
 
 static uint8_t getNextLowerAddress(uint8_t self)
@@ -403,11 +477,231 @@ static uint8_t getRandomLowerAddr(uint8_t self)
     {
         addr = NODE_POOL[rand() % POOL_SIZE];
         trial++;
-    } while ((addr >= self && trial <= maxTrials));
-    return (trial > maxTrials) ? ADDR_SINK : addr;
+    } while ((addr >= self && trial <= maxBeacons));
+    return (trial > maxBeacons) ? ADDR_SINK : addr;
 }
 
 static void setDebug(uint8_t d)
 {
     debugFlag = d;
+}
+
+static void *sendBeacon(void *args)
+{
+
+    MAC *m = (MAC *)args;
+    int trials = 0;
+    if (debugFlag)
+    {
+        printf("%s - ## Sending beacons...\n", timestamp());
+    }
+    uint8_t beacon = CTRL_BCN;
+    do
+    {
+        if (MAC_send(m, ADDR_BROADCAST, &beacon, 1))
+        {
+            trials++;
+        }
+        usleep(rand() % 100000);
+    } while (trials < maxBeacons);
+
+    if (debugFlag)
+    {
+        printf("%s - ## Sent %d beacons...\n", timestamp(), trials);
+    }
+}
+
+static void *receiveBeacon(void *args)
+{
+
+    MAC *m = (MAC *)args;
+    int trials = 0;
+    if (debugFlag)
+    {
+        printf("%s - ## Starting parent selection...\n", timestamp());
+    }
+
+    do
+    {
+        uint8_t beacon;
+        int len = MAC_timedrecv(m, &beacon, 2);
+        if (len > 0)
+        {
+            if (beacon == CTRL_BCN)
+            {
+                uint8_t addr = m->recvH.src_addr;
+                int rssi = m->RSSI;
+                updateActiveNodes(addr, rssi, false);
+                if (m->RSSI > parentRSSI)
+                {
+                    parentAddr = addr;
+                    parentRSSI = rssi;
+                    if (debugFlag)
+                    {
+                        printf("%s - ## Setting parent: %02d (%02d)\n", timestamp(), addr, rssi);
+                    }
+                }
+            }
+        }
+        else
+        {
+            trials++;
+        }
+        usleep(rand() % 1000);
+    } while (trials < maxBeacons || parentAddr == ADDR_BROADCAST);
+    if (parentAddr == ADDR_BROADCAST)
+    {
+        printf("%s - ## Error: Couldn't select parent. Timed out\n", timestamp());
+        exit(EXIT_FAILURE);
+    }
+    else
+    {
+        printf("%s - Parent :%02d (%d)\n", timestamp(), parentAddr, parentRSSI);
+    }
+}
+
+static void selectParent()
+{
+    pthread_t send, recv;
+    parentRSSI = -128;
+    parentAddr = ADDR_BROADCAST;
+
+    if (pthread_create(&send, NULL, sendBeacon, &mac) != 0)
+    {
+        printf("Failed to create beacon send thread");
+        exit(1);
+    }
+
+    if (pthread_create(&recv, NULL, receiveBeacon, &mac) != 0)
+    {
+        printf("Failed to create beacon receive thread");
+        exit(1);
+    }
+    pthread_join(send, NULL);
+    pthread_join(recv, NULL);
+}
+
+int detectLoop(RoutingMessage msg)
+{
+
+    return mac.recvH.src_addr == mac.addr;
+}
+
+void updateActiveNodes(uint8_t addr, int RSSI, bool child)
+{
+    time_t currentTime = time(NULL);
+    sem_wait(&network.mutex);
+    NodeInfo *node = &network.nodes[addr];
+    int numActive;
+    bool new = !node->isActive;
+    if (new)
+    {
+        node->addr = addr;
+        node->isActive = true;
+        node->isChild = child;
+        network.numActive++;
+        numActive = network.numActive;
+        if (parentAddr == node->addr && node->addr != ADDR_BROADCAST)
+        {
+            printf("%s - Direct loop detected..\n", timestamp());
+            changeParent();
+        }
+    }
+    node->RSSI = RSSI;
+    node->lastSeen = currentTime;
+    sem_post(&network.mutex);
+    if (new)
+    {
+        if (debugFlag)
+        {
+            printf("%s - ##  New %s: %02d (%02d)\n", timestamp(), child ? "child" : "neighbour", addr);
+            printf("%s - ##  Active neighbour count: %0d\n", timestamp(), numActive);
+        }
+        if (RSSI > parentRSSI)
+        {
+            parentAddr = addr;
+            parentRSSI = RSSI;
+            printf("%s - ## Setting parent: %02d (%02d)\n", timestamp(), addr, RSSI);
+        }
+    }
+}
+
+static void changeParent()
+{
+    uint8_t newParent = ADDR_SINK;
+    sem_wait(&network.mutex);
+    int8_t highestRSSI = parentRSSI;
+    unsigned short numActive = network.numActive;
+    uint8_t pool[network.numActive];
+    int p = 0;
+    for (int i = 0, active = 0; i < MAX_ACTIVE_NODES && active < network.numActive; i++)
+    {
+        NodeInfo node = network.nodes[i];
+        if (node.isActive)
+        {
+            if (debugFlag)
+            {
+                printf("%s - ##  Active: %02d (%02d)\n", timestamp(), node.addr, node.RSSI);
+            }
+            // Choose random neighbour as parent
+            if (!node.isChild && node.addr != parentAddr)
+            {
+                pool[p++] = node.addr;
+            }
+            // Choose node with higher RSSI
+            // if (node.RSSI > highestRSSI && !node.isChild && node.addr != parentAddr)
+            // {
+            //     newParent = node.addr;
+            //     highestRSSI = node.RSSI;
+            // }
+            active++;
+        }
+    }
+    sem_post(&network.mutex);
+    newParent = pool[rand() % numActive];
+    parentAddr = newParent;
+    parentRSSI = highestRSSI;
+
+    printf("%s - New parent: %02d (%02d)\n", timestamp(), parentAddr, parentRSSI);
+}
+
+void initActiveNodes()
+{
+    sem_init(&network.mutex, 0, 1);
+    network.numActive = 0;
+    memset(network.nodes, 0, sizeof(network.nodes));
+}
+
+static void cleanupInactiveNodes()
+{
+    time_t currentTime = time(NULL);
+    sem_wait(&network.mutex);
+    unsigned short numActive = network.numActive;
+    for (int i = 0, active = 0; i < MAX_ACTIVE_NODES && active < network.numActive; i++)
+    {
+        NodeInfo node = network.nodes[i];
+        if (node.isActive && (currentTime - network.nodes[i].lastSeen) > NODE_TIMEOUT)
+        {
+            printf("%s - ## Node: %02d inactive\n", timestamp(), node.addr);
+            NodeInfo *ptr = &node;
+            ptr->isActive = false;
+            network.numActive--;
+            numActive = network.numActive;
+            active++;
+            if (parentAddr == node.addr)
+            {
+                if (debugFlag)
+                {
+                    printf("%s - ##  Current parent is a child: %02d\n", timestamp(), node.addr);
+                }
+                changeParent();
+            }
+        }
+    }
+    sem_post(&network.mutex);
+    if (debugFlag)
+    {
+        printf("%s - ##  Active neighbour count: %d\n", timestamp(), numActive);
+    }
+    network.lastCleanupTime = time(NULL);
 }
